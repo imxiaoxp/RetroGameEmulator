@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="referrer" content="no-referrer">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EmulatorJS</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+        #game { width: 100%; height: 100%; }
+
+        .loading {
+            position: fixed; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center; color: #06B6D4; z-index: 100;
+        }
+        .spinner {
+            border: 4px solid rgba(6,182,212,0.3);
+            border-top: 4px solid #06B6D4;
+            border-radius: 50%; width: 50px; height: 50px;
+            animation: spin 1s linear infinite; margin: 0 auto 20px;
+        }
+        @keyframes spin {
+            0%   { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .error {
+            position: fixed; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center; color: #EC4899; z-index: 200;
+        }
+    </style>
+</head>
+<body>
+
+<div class="loading" id="loading" style="display:block;">
+    <div class="spinner"></div>
+    <div id="loadingText">正在加载游戏...</div>
+</div>
+
+<div id="game"></div>
+
+<script>
+(function () {
+    'use strict';
+
+    // 从 URL 参数读取配置
+    var params    = new URLSearchParams(window.location.search);
+    var sourceUrl = params.get('sourceUrl') || '';
+    var fileName  = params.get('fileName')  || '';
+    var core      = params.get('core')      || 'arcade';
+    var biosUrl   = params.get('biosUrl')   || '';
+    var biosName  = params.get('biosName')  || '';
+    var netplay   = params.get('netplay')   === '1';
+    var coreUrl   = params.get('coreUrl')   || '';
+    var patchRoms = params.get('patchRoms') || '';
+    var romData   = params.get('romData')   || '';
+
+    // 从 URL 中提取文件名（最后一段路径）
+    function extractName(url) {
+        try {
+            var segments = url.split('/');
+            var last = segments[segments.length - 1];
+            // 去掉查询参数
+            return last.split('?')[0].split('#')[0] || '';
+        } catch (e) { return ''; }
+    }
+
+    // BIOS 文件名：显式指定 > 从 URL 提取（与 ROM 的 fileName 逻辑一致）
+    if (biosUrl && !biosName) {
+        biosName = extractName(biosUrl);
+    }
+
+    // IPS/BPS 补丁列表：与 extraRoms 解析逻辑一致
+    // 每行一个，格式为 "文件名|下载地址"，文件名可省略
+    var patchEntries = [];
+    if (patchRoms) {
+        var plines = patchRoms.split(/[\r\n]+/);
+        for (var pi = 0; pi < plines.length; pi++) {
+            var pline = plines[pi].trim();
+            if (!pline) continue;
+            var psep = pline.indexOf('|');
+            if (psep > 0) {
+                var pname = pline.substring(0, psep).trim();
+                var purl = pline.substring(psep + 1).trim();
+                if (pname && purl) {
+                    patchEntries.push({ name: pname, url: purl });
+                }
+            } else if (pline) {
+                var pname2 = extractName(pline);
+                if (pname2) {
+                    patchEntries.push({ name: pname2, url: pline.trim() });
+                }
+            }
+        }
+    }
+
+    // 解析 RomData 条目：每行一个，格式为 "文件名|下载地址"
+    // 文件名将写入 /home/web_user/retroarch/system/fbneo/ips/<游戏名>/ 目录
+    var romDataEntries = [];
+    if (romData) {
+        var rdLines = romData.split(/[\r\n]+/);
+        for (var rdi = 0; rdi < rdLines.length; rdi++) {
+            var rdLine = rdLines[rdi].trim();
+            if (!rdLine) continue;
+            var rdSep = rdLine.indexOf('|');
+            if (rdSep > 0) {
+                var rdName = rdLine.substring(0, rdSep).trim();
+                var rdUrl = rdLine.substring(rdSep + 1).trim();
+                if (rdName && rdUrl) {
+                    romDataEntries.push({ name: rdName, url: rdUrl });
+                }
+            } else if (rdLine) {
+                var rdName2 = extractName(rdLine);
+                if (rdName2) {
+                    romDataEntries.push({ name: rdName2, url: rdLine.trim() });
+                }
+            }
+        }
+    }
+
+    // 从主 ROM 文件名提取游戏名（去掉 .zip/.7z 后缀）
+    var gameBaseName = fileName.replace(/\.(zip|7z)$/i, '');
+
+    var LOADER_URL = 'https://cdn.emulatorjs.org/4.3.0-pre/data/loader.js';
+    var DATA_PATH  = 'https://cdn.emulatorjs.org/4.3.0-pre/data/';
+
+    var ICE_SERVERS = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'turn:openrelay.metered.ca:80',     username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443',    username: 'openrelayproject', credential: 'openrelayproject' }
+    ];
+
+    if (!sourceUrl || !fileName) {
+        document.getElementById('loadingText').textContent = '缺少 ROM 配置参数';
+        return;
+    }
+
+    // =========================================================
+    //  ROM 文件映射表：fileName → blob
+    //  所有需要 fetch 拦截的文件都存入此表
+    // =========================================================
+    var romStore = {};
+
+    // =========================================================
+    //  并行下载所有 ROM 文件
+    // =========================================================
+    function downloadFile(url, label) {
+        return fetch(url, { mode: 'cors', credentials: 'omit' })
+            .then(function (res) {
+                if (!res.ok) throw new Error(label + ' HTTP ' + res.status);
+                return res.blob();
+            });
+    }
+
+    // 主 ROM
+    var mainPromise = downloadFile(sourceUrl, 'ROM')
+        .then(function (blob) { romStore[fileName] = blob; });
+
+    // BIOS（只要 biosUrl 有值就下载拦截，逻辑与 ROM 一致）
+    var biosPromise = biosUrl
+        ? downloadFile(biosUrl, 'BIOS')
+            .then(function (blob) { romStore[biosName] = blob; })
+            .catch(function (err) {
+                console.warn('BIOS 下载失败:', err.message);
+            })
+        : Promise.resolve();
+
+    // 全局变量：自定义核心 blob（预下载后由 fetch 拦截器注入）
+    var customCoreBlob = null;
+
+    // 自定义核心（可选）
+    var corePromise = coreUrl
+        ? downloadFile(coreUrl, 'CustomCore')
+            .then(function (blob) { customCoreBlob = blob; })
+            .catch(function (err) {
+                console.warn('自定义核心下载失败:', err.message);
+            })
+        : Promise.resolve();
+
+    // 补丁 ArrayBuffer 列表（按顺序，后续逐个应用到 ROM）
+    var patchBuffers = [];
+
+    // IPS/BPS 补丁下载（可选，单个失败不阻塞）
+    var patchPromises = patchEntries.map(function (entry) {
+        return downloadFile(entry.url, 'Patch ' + entry.name)
+            .then(function (blob) { return blob.arrayBuffer(); })
+            .then(function (buf) { patchBuffers.push(buf); })
+            .catch(function (err) {
+                console.warn('补丁 ' + entry.name + ' 下载失败:', err.message);
+            });
+    });
+
+    // RomData 文件下载（FBNeo Plus 核心：.dat 描述 + .ips 补丁）
+    // 下载后存为 Uint8Array，等 Emscripten FS 就绪后写入虚拟文件系统
+    var romDataFiles = []; // [{name, data: Uint8Array}]
+    var romDataPromises = romDataEntries.map(function (entry) {
+        return downloadFile(entry.url, 'RomData ' + entry.name)
+            .then(function (blob) { return blob.arrayBuffer(); })
+            .then(function (buf) {
+                romDataFiles.push({ name: entry.name, data: new Uint8Array(buf) });
+            })
+            .catch(function (err) {
+                console.warn('RomData ' + entry.name + ' 下载失败:', err.message);
+            });
+    });
+
+    // 全部下载完成后启动
+    Promise.all([mainPromise, biosPromise, corePromise].concat(patchPromises, romDataPromises))
+        .then(function () { boot(); })
+        .catch(function (err) {
+            document.getElementById('loading').style.display = 'none';
+            document.body.innerHTML = '<div class="error"><div style="font-size:48px;">❌</div><div style="font-size:20px;margin-top:10px;">ROM 下载失败</div><div style="color:#9CA3AF;margin-top:10px;">' + err.message + '</div></div>';
+        });
+
+    // =========================================================
+    //  IPS 补丁应用：将 IPS 数据逐个应用到 ROM ArrayBuffer
+    // =========================================================
+    function applyIpsPatch(romBuf, ipsBuf) {
+        var rom = new Uint8Array(romBuf);
+        var ips = new Uint8Array(ipsBuf);
+        // 校验 IPS 头部 "PATCH"
+        if (ips[0] !== 0x50 || ips[1] !== 0x41 || ips[2] !== 0x54 || ips[3] !== 0x43 || ips[4] !== 0x48) {
+            console.warn('非标准 IPS 文件头，跳过');
+            return romBuf;
+        }
+        var offset = 5;
+        // 预分配：IPS 可能扩展 ROM 大小
+        var out = new Uint8Array(rom.length);
+        out.set(rom);
+
+        while (offset < ips.length - 3) {
+            // 检查 "EOF" 标记
+            if (ips[offset] === 0x45 && ips[offset + 1] === 0x4F && ips[offset + 2] === 0x46) break;
+            // 3 字节大端偏移
+            var addr = (ips[offset] << 16) | (ips[offset + 1] << 8) | ips[offset + 2];
+            offset += 3;
+            // 2 字节大端长度
+            var len = (ips[offset] << 8) | ips[offset + 1];
+            offset += 2;
+            if (len === 0) {
+                // RLE 编码：重复单个字节
+                var rleLen = (ips[offset] << 8) | ips[offset + 1];
+                offset += 2;
+                var val = ips[offset++];
+                // 按需扩展
+                if (addr + rleLen > out.length) {
+                    var bigger = new Uint8Array(addr + rleLen);
+                    bigger.set(out);
+                    out = bigger;
+                }
+                for (var r = 0; r < rleLen; r++) out[addr + r] = val;
+            } else {
+                // 普通记录：逐字节写入
+                if (addr + len > out.length) {
+                    var bigger2 = new Uint8Array(addr + len);
+                    bigger2.set(out);
+                    out = bigger2;
+                }
+                for (var w = 0; w < len; w++) out[addr + w] = ips[offset + w];
+                offset += len;
+            }
+        }
+        return out.buffer;
+    }
+
+    // =========================================================
+    //  启动模拟器
+    // =========================================================
+    function boot() {
+        // 有补丁则按顺序应用到主 ROM
+        if (patchBuffers.length > 0 && romStore[fileName]) {
+            romStore[fileName].arrayBuffer().then(function (romBuf) {
+                for (var p = 0; p < patchBuffers.length; p++) {
+                    romBuf = applyIpsPatch(romBuf, patchBuffers[p]);
+                }
+                romStore[fileName] = new Blob([romBuf]);
+                startEmulator();
+            });
+        } else {
+            startEmulator();
+        }
+    }
+
+    function startEmulator() {
+        var romNames = Object.keys(romStore);
+
+        // 匹配 romStore 中的文件名
+        function matchRom(url) {
+            if (!url) return null;
+            for (var i = 0; i < romNames.length; i++) {
+                if (url.includes(romNames[i])) {
+                    return romNames[i];
+                }
+            }
+            return null;
+        }
+
+        // 拦截 fetch
+        var origFetch = window.fetch;
+        window.fetch = function (input, init) {
+            var url = typeof input === 'string' ? input : (input && input.url);
+            // 自定义核心拦截：请求 /cores/ 下的 .data 文件时替换为预下载的核心
+            if (customCoreBlob && url && /\/cores\/[^/]+-wasm\.data/.test(url)) {
+                return Promise.resolve(new Response(customCoreBlob, {
+                    headers: { 'Content-Type': 'application/octet-stream' }
+                }));
+            }
+            var matched = matchRom(url);
+            if (matched) {
+                return Promise.resolve(new Response(romStore[matched], {
+                    headers: { 'Content-Type': 'application/zip' }
+                }));
+            }
+            return origFetch.call(this, input, init);
+        };
+
+        // 拦截 XMLHttpRequest（街机核心可能用 XHR 加载 BIOS/父ROM）
+        var OrigXHR = window.XMLHttpRequest;
+        window.XMLHttpRequest = function () {
+            var xhr = new OrigXHR();
+            var origOpen = xhr.open;
+            xhr.open = function (method, url) {
+                var matched = matchRom(url);
+                if (matched) {
+                    // 重写为 blob URL，让 XHR 读取本地数据
+                    var blobUrl = URL.createObjectURL(romStore[matched]);
+                    return origOpen.call(this, method, blobUrl);
+                }
+                return origOpen.apply(this, arguments);
+            };
+            return xhr;
+        };
+        // 保留原型链，避免 instanceof 检测失败
+        window.XMLHttpRequest.prototype = OrigXHR.prototype;
+        window.XMLHttpRequest.UNSENT = OrigXHR.UNSENT;
+        window.XMLHttpRequest.OPENED = OrigXHR.OPENED;
+        window.XMLHttpRequest.HEADERS_RECEIVED = OrigXHR.HEADERS_RECEIVED;
+        window.XMLHttpRequest.LOADING = OrigXHR.LOADING;
+        window.XMLHttpRequest.DONE = OrigXHR.DONE;
+
+        // 设置 EmulatorJS 全局变量
+        window.EJS_player = '#game';
+        window.EJS_gameUrl = 'https://cdn.emulatorjs.org/4.3.0-pre/roms/' + fileName;
+        window.EJS_core = core;
+        // BIOS：有值则用 CDN 路径触发拦截，与 ROM 的 EJS_gameUrl 逻辑一致
+        window.EJS_biosUrl = biosUrl ? ('https://cdn.emulatorjs.org/4.3.0-pre/roms/' + biosName) : '';
+        window.EJS_disableAutoLang = true;
+        window.EJS_language = 'zh';
+        window.EJS_pathtodata = DATA_PATH;
+        window.EJS_startOnLoaded = true;
+        window.EJS_gameID = 1;
+
+        // RomData 文件写入 Emscripten 虚拟文件系统
+        // FBNeo Plus 核心在 /home/web_user/retroarch/system/fbneo/ips/<游戏名>/ 下查找 .dat + .ips
+        // 必须在核心初始化之前写入（Module.preRun），否则核心扫描目录时文件还不存在，IPS 选项列表为空
+        if (romDataFiles.length > 0) {
+            window.Module = window.Module || {};
+            var preRunList = window.Module.preRun || [];
+            if (typeof preRunList === 'function') preRunList = [preRunList];
+            preRunList.push(function () {
+                try {
+                    var FS = window.Module.FS;
+                    if (!FS) {
+                        console.warn('Emscripten FS 不可用，RomData 写入跳过');
+                        return;
+                    }
+                    // 创建目录链：先确保父目录存在
+                    var dirs = [
+                        '/home/web_user/retroarch',
+                        '/home/web_user/retroarch/system',
+                        '/home/web_user/retroarch/system/fbneo',
+                        '/home/web_user/retroarch/system/fbneo/ips',
+                        '/home/web_user/retroarch/system/fbneo/ips/' + gameBaseName
+                    ];
+                    for (var di = 0; di < dirs.length; di++) {
+                        try { FS.mkdir(dirs[di]); } catch (e) { /* 已存在 */ }
+                    }
+                    // 写入所有 RomData 文件
+                    for (var rdi = 0; rdi < romDataFiles.length; rdi++) {
+                        var f = romDataFiles[rdi];
+                        try {
+                            FS.writeFile(dirs[dirs.length - 1] + '/' + f.name, f.data);
+                            console.log('RomData 写入: ' + dirs[dirs.length - 1] + '/' + f.name);
+                        } catch (writeErr) {
+                            console.warn('RomData 写入失败 ' + f.name + ':', writeErr.message);
+                        }
+                    }
+                } catch (e) {
+                    console.warn('RomData 注入异常:', e.message);
+                }
+            });
+            window.Module.preRun = preRunList;
+        }
+
+        // 联机配置
+        if (netplay) {
+            try {
+                var origin = window.parent.location.origin;
+                window.EJS_netplayServer = origin;
+            } catch (e) {
+                window.EJS_netplayServer = window.location.origin;
+            }
+            window.EJS_netplayICEServers = ICE_SERVERS;
+        }
+
+        // 加载 loader.js
+        var script = document.createElement('script');
+        script.src = LOADER_URL + '?v=' + Date.now();
+        script.onload = function () {
+            document.getElementById('loading').style.display = 'none';
+            if (netplay && window.EJS && window.EJS.netplay && window.EJS.netplay.openMenu) {
+                setTimeout(function () { window.EJS.netplay.openMenu(); }, 1000);
+            }
+        };
+        script.onerror = function () {
+            document.body.innerHTML = '<div class="error"><div style="font-size:48px;">❌</div><div style="font-size:20px;margin-top:10px;">模拟器核心加载失败</div></div>';
+        };
+        document.body.appendChild(script);
+    }
+})();
+</script>
+
+</body>
+</html>

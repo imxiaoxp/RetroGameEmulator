@@ -1,0 +1,49 @@
+/**
+ * RetroGameEmulator - 前台模拟器样式
+ */
+.ejs-container {
+    position: relative;
+    width: 100%;
+    max-width: 960px;
+    margin: 20px auto;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+    aspect-ratio: 4 / 3;
+}
+
+.ejs-container .ejs-game {
+    width: 100%;
+    height: 100%;
+}
+
+.ejs-container .ejs-loading {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: #06B6D4;
+    font-family: Arial, sans-serif;
+    font-size: 16px;
+    z-index: 10;
+}
+
+.ejs-spinner {
+    border: 4px solid rgba(6, 182, 212, 0.3);
+    border-top: 4px solid #06B6D4;
+    border-radius: 50%;
+    width: 50px;
+    height: 50px;
+    animation: ejs-spin 1s linear infinite;
+    margin-bottom: 16px;
+}
+
+@keyframes ejs-spin {
+    0%   { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
